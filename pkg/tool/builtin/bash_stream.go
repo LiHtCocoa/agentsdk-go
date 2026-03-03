@@ -14,11 +14,6 @@ import (
 	"github.com/cexll/agentsdk-go/pkg/tool"
 )
 
-const (
-	streamDrainGraceOnCancel = time.Second
-	streamDrainGraceOnExit   = 5 * time.Second
-)
-
 // StreamExecute runs the bash command while emitting incremental output. It
 // preserves backwards compatibility by sharing validation and metadata with
 // Execute, and spools output to disk after crossing the configured threshold.
@@ -74,6 +69,29 @@ func (b *BashTool) StreamExecute(ctx context.Context, params map[string]interfac
 
 	readCtx, stopReads := context.WithCancel(execCtx)
 	defer stopReads()
+	defer stdoutPipe.Close()
+	defer stderrPipe.Close()
+
+	var closePipesOnce sync.Once
+	closePipes := func() {
+		closePipesOnce.Do(func() {
+			_ = stdoutPipe.Close()
+			_ = stderrPipe.Close()
+		})
+	}
+
+	cancelWatcherDone := make(chan struct{})
+	go func() {
+		select {
+		case <-execCtx.Done():
+			// Unblock scanners promptly when timeout/cancel fires. This keeps the
+			// old read-before-wait ordering (better output reliability) while
+			// preventing wg.Wait from hanging on inherited child FDs.
+			stopReads()
+			closePipes()
+		case <-cancelWatcherDone:
+		}
+	}()
 
 	var stdoutErr, stderrErr error
 	var wg sync.WaitGroup
@@ -90,14 +108,9 @@ func (b *BashTool) StreamExecute(ctx context.Context, params map[string]interfac
 		stderrErr = consumeStream(readCtx, stderrPipe, emit, spool, true)
 	}()
 
-	readersDone := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(readersDone)
-	}()
-
+	wg.Wait()
+	close(cancelWatcherDone)
 	waitErr := cmd.Wait()
-	drainReaders(execCtx, stopReads, stdoutPipe, stderrPipe, readersDone)
 
 	duration := time.Since(start)
 
@@ -139,25 +152,6 @@ func (b *BashTool) StreamExecute(ctx context.Context, params map[string]interfac
 		return result, fmt.Errorf("command failed: %w", runErr)
 	}
 	return result, nil
-}
-
-func drainReaders(execCtx context.Context, stopReads context.CancelFunc, stdoutPipe io.ReadCloser, stderrPipe io.ReadCloser, readersDone <-chan struct{}) {
-	grace := streamDrainGraceOnExit
-	if execCtx.Err() != nil {
-		grace = streamDrainGraceOnCancel
-	}
-
-	select {
-	case <-readersDone:
-		return
-	case <-time.After(grace):
-		// Background descendants can keep inherited pipe FDs open after the
-		// parent shell exits. Close pipes proactively so scanners stop blocking.
-		stopReads()
-		_ = stdoutPipe.Close()
-		_ = stderrPipe.Close()
-		<-readersDone
-	}
 }
 
 func consumeStream(ctx context.Context, r io.ReadCloser, emit func(chunk string, isStderr bool), spool *bashOutputSpool, isStderr bool) error {

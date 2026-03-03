@@ -29,7 +29,13 @@ func TestBashToolStreamExecute(t *testing.T) {
 		t.Fatalf("expected success")
 	}
 	if res.Output == "" {
-		t.Fatalf("expected output text")
+		data, ok := res.Data.(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected data map, got %T", res.Data)
+		}
+		if _, ok := data["output_file"]; !ok {
+			t.Fatalf("expected output text or output_file reference")
+		}
 	}
 }
 
