@@ -246,14 +246,15 @@ func (c *compactor) compact(ctx context.Context, hist *message.History, snapshot
 	older := snapshot[:cut]
 	kept := snapshot[cut:]
 
-	preservedPrefix := make([]bool, len(older))
+	preservedInitial := make([]bool, len(older))
+	preservedUserText := make([]bool, len(older))
 	if c.cfg.PreserveInitial && c.cfg.InitialCount > 0 {
 		n := c.cfg.InitialCount
 		if n > len(older) {
 			n = len(older)
 		}
 		for i := 0; i < n; i++ {
-			preservedPrefix[i] = true
+			preservedInitial[i] = true
 		}
 	}
 
@@ -261,14 +262,14 @@ func (c *compactor) compact(ctx context.Context, hist *message.History, snapshot
 		var counter message.NaiveCounter
 		total := 0
 		for i := len(older) - 1; i >= 0; i-- {
-			if preservedPrefix[i] {
+			if preservedInitial[i] {
 				continue
 			}
 			if older[i].Role != "user" || strings.TrimSpace(older[i].Content) == "" {
 				continue
 			}
 			total += counter.Count(older[i])
-			preservedPrefix[i] = true
+			preservedUserText[i] = true
 			if total >= c.cfg.UserTextTokens {
 				break
 			}
@@ -280,7 +281,7 @@ func (c *compactor) compact(ctx context.Context, hist *message.History, snapshot
 		}
 		keep := false
 		for i := span.start; i < span.end; i++ {
-			if preservedPrefix[i] {
+			if preservedInitial[i] {
 				keep = true
 				break
 			}
@@ -289,15 +290,20 @@ func (c *compactor) compact(ctx context.Context, hist *message.History, snapshot
 			continue
 		}
 		for i := span.start; i < span.end; i++ {
-			preservedPrefix[i] = true
+			preservedInitial[i] = true
 		}
 	}
 
-	preservedOlder := make([]message.Message, 0, len(older))
+	initial := make([]message.Message, 0, len(older))
+	userText := make([]message.Message, 0, len(older))
 	summarize := make([]message.Message, 0, len(older))
 	for i, msg := range older {
-		if preservedPrefix[i] {
-			preservedOlder = append(preservedOlder, message.CloneMessage(msg))
+		if preservedInitial[i] {
+			initial = append(initial, message.CloneMessage(msg))
+			continue
+		}
+		if preservedUserText[i] {
+			userText = append(userText, message.CloneMessage(msg))
 			continue
 		}
 		summarize = append(summarize, msg)
@@ -321,17 +327,18 @@ func (c *compactor) compact(ctx context.Context, hist *message.History, snapshot
 		summary = "对话摘要为空"
 	}
 
-	newMsgs := make([]message.Message, 0, len(preservedOlder)+1+len(kept))
-	newMsgs = append(newMsgs, preservedOlder...)
+	newMsgs := make([]message.Message, 0, len(initial)+1+len(userText)+len(kept))
+	newMsgs = append(newMsgs, initial...)
 	newMsgs = append(newMsgs, message.Message{
 		Role:    "system",
 		Content: fmt.Sprintf("对话摘要：\n%s", summary),
 	})
+	newMsgs = append(newMsgs, userText...)
 	newMsgs = append(newMsgs, message.CloneMessages(kept)...)
 	hist.Replace(newMsgs)
 
 	tokensAfter := hist.TokenCount()
-	preservedMsgs := len(preservedOlder) + len(kept)
+	preservedMsgs := len(initial) + len(userText) + len(kept)
 	return compactResult{
 		summary:       summary,
 		originalMsgs:  len(snapshot),
